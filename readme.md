@@ -98,32 +98,52 @@ run.bat
 ## 📊 Sample Output
 
 ============================================================
+
   COLLATZ CONJECTURE GPU VALIDATOR
+  
   Radeon 9060XT | 2048 Cores | 3.74 Billion/sec
+  
 ============================================================
 
+
 [GPU] Found 1 AMD GPU(s)
+
   0: AMD Radeon 9060XT
+  
       Compute Units: 32
+      
       Max Threads/Block: 1024
+      
 
 [Config] Free VRAM: 15 GB
+
 [Config] Batch Size: 512M numbers
+
 [Config] Buffers: 2
+
 [Config] Threads/Block: 256
+
 
 Running...
 
 ============================================================
+
   COLLATZ GPU VALIDATOR
+  
   Speed: 3740000000 numbers/sec
+  
 ============================================================
 
   Batch:      42
+  
   Verified to: 21,504,000,000
+  
   Total:      21,504,000,000
+  
   Max Steps:  523 (number 9,780,657,631)
+  
   Time:       5m 45s
+  
 ============================================================
 
 ---
