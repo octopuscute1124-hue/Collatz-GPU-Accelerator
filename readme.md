@@ -1,4 +1,3 @@
-```markdown
 # 🔢 Collatz Conjecture GPU Accelerator
 
 <div align="center">
@@ -38,30 +37,39 @@ This project uses massive GPU parallelism to verify billions of numbers against 
 
 ## 📁 Project Structure
 
-```
 Collatz-GPU-Accelerator/
+
 ├── src/
+
 │   ├── collatz.hip       # GPU Kernel (HIP/C++)
+
 │   └── collatz.cpp       # Host code (CPU control)
+
 ├── build.bat             # Build script (Windows)
+
 ├── run.bat               # Run script (menu + checkpoint)
+
 ├── start.bat             # Quick start
+
 ├── collatz_amd.exe       # Compiled binary (after build)
+
 ├── checkpoint.bin        # Progress checkpoint (runtime)
+
 ├── LICENSE               # MIT License
+
 └── README.md             # This file
-```
 
 ---
 
 ## ⚡ Quick Start
 
-```bash
 git clone https://github.com/octopuscute1124-hue/Collatz-GPU-Accelerator.git
+
 cd Collatz-GPU-Accelerator
+
 build.bat
+
 run.bat
-```
 
 ---
 
@@ -79,17 +87,16 @@ run.bat
 
 ## 🎯 Technical Highlights
 
-- **Double Buffering** – Hide transfer latency, maximize GPU utilization
-- **Early Termination** – Skip already-verified numbers to save compute
-- **GPU Reduction** – Aggregate statistics on GPU; CPU reads only 5 numbers per batch
-- **Checkpointing** – Resume from last progress if interrupted
-- **Counterexample Detection** – Real-time detection and validation
+- Double Buffering – Hide transfer latency, maximize GPU utilization
+- Early Termination – Skip already-verified numbers to save compute
+- GPU Reduction – Aggregate statistics on GPU; CPU reads only 5 numbers per batch
+- Checkpointing – Resume from last progress if interrupted
+- Counterexample Detection – Real-time detection and validation
 
 ---
 
 ## 📊 Sample Output
 
-```
 ============================================================
   COLLATZ CONJECTURE GPU VALIDATOR
   Radeon 9060XT | 2048 Cores | 3.74 Billion/sec
@@ -118,7 +125,6 @@ Running...
   Max Steps:  523 (number 9,780,657,631)
   Time:       5m 45s
 ============================================================
-```
 
 ---
 
@@ -149,4 +155,3 @@ Open an Issue on GitHub for any questions.
 ---
 
 Made with 🔢 by octopodiformes
-```
