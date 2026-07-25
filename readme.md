@@ -78,7 +78,7 @@ run.bat
 | Item | Requirement |
 |------|-------------|
 | OS | Windows 10/11 |
-| GPU | AMD Radeon RX 6000/7000 series (RDNA 2/3) |
+| GPU | AMD Radeon RX 6000/7000/9000 series (RDNA 2/3/4) |
 | Driver | AMD ROCm 7.1 or newer |
 | Compiler | Visual Studio 2022 |
 | Dependencies | HIP, ROCm |
