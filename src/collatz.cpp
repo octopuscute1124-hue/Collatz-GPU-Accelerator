@@ -1,18 +1,21 @@
 /**
- * collatz.cpp - Collatz Conjecture GPU Validator
- * 
- * A high-performance GPU-accelerated validator for the Collatz conjecture.
- * Runs on AMD Radeon 9060XT at 3.74 Billion numbers/second.
- * 
- * Features:
- *   - GPU kernel computation (HIP)
- *   - Triple buffering for maximum throughput
- *   - Checkpointing for resume support
- *   - Real-time performance monitoring
- *   - Early termination optimization
- * 
- * Author: A determined C++ developer with too much time
- * License: MIT
+ * collatz.cpp - Corrected Collatz verifier host code
+ *
+ * Fixes vs. the original:
+ *   - Replaced the mathematically invalid "modular residue" skip table
+ *     with an exact k-step Collatz acceleration table (see collatz.hip
+ *     for the derivation). This is the single most important fix: the
+ *     old code was not actually verifying ~95% of numbers.
+ *   - Removed the periodic hipDeviceReset() (very expensive, and not
+ *     needed - alloc/free was already paired correctly).
+ *   - Replaced 5 single-thread "reset" kernel launches per batch with
+ *     hipMemsetAsync.
+ *   - Reduced default batch size to fit comfortably in 16GB with a
+ *     large safety margin (previous default used 12+GB of VRAM by itself).
+ *
+ * IMPORTANT: any checkpoint.bin produced by the old binary encodes
+ * progress that was never actually verified for most numbers. Delete
+ * checkpoint.bin before running this version.
  */
 
 #include <iostream>
@@ -24,10 +27,6 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 
-// ============================================================
-// MACROS
-// ============================================================
-
 #define HIP_CHECK(call) \
     do { \
         hipError_t err = call; \
@@ -38,52 +37,35 @@
         } \
     } while(0)
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
 struct Config {
-    static constexpr uint64_t BATCH_SIZE  = 512ULL * 1024 * 1024;  // 512M numbers
-    static constexpr uint32_t MAX_STEPS   = 100000;                // Safe limit
-    static constexpr int      SAVE_INTERVAL = 10;                  // Checkpoint every N batches
-    
-    // Hardware tuning for Radeon 9060XT (2048 cores)
-    static constexpr int      THREADS_PER_BLOCK = 256;
-    static constexpr int      NUM_BUFFERS       = 2;                // Double buffering
+    uint64_t batchSize = 256ull * 1024 * 1024;   // 256M numbers/batch (~6GB VRAM w/ double buffer)
+    uint32_t maxSteps = 100000;
+    int saveInterval = 10;
 };
-
-// ============================================================
-// CHECKPOINT
-// ============================================================
 
 struct Checkpoint {
-    uint64_t last_number;          // Last verified number
-    uint64_t total_verified;       // Total numbers verified
-    uint64_t total_steps;          // Total steps computed
-    uint32_t max_steps;            // Record maximum steps
-    uint64_t max_steps_number;     // Number with record steps
-    uint64_t batch_count;          // Number of batches processed
-    double   total_time;           // Total runtime in seconds
-    uint64_t start_value;          // Current early termination threshold
-    uint64_t total_real_verified;  // For speed calculation
+    uint64_t lastNumber;
+    uint64_t totalVerified;
+    uint64_t totalSteps;
+    uint32_t maxSteps;
+    uint64_t maxStepsNumber;
+    uint64_t batchCount;
+    double totalTime;
+    uint64_t lastVerifiedRange;
+    uint64_t totalRealVerified;
 };
 
-// ============================================================
-// CHECKPOINT I/O
-// ============================================================
-
-Checkpoint load_checkpoint() {
+Checkpoint loadCheckpoint() {
     Checkpoint cp = {1, 0, 0, 0, 1, 0, 0, 0, 0};
     std::ifstream file("checkpoint.bin", std::ios::binary);
     if (file.is_open()) {
         file.read((char*)&cp, sizeof(Checkpoint));
         file.close();
-        std::cout << "[Checkpoint] Loaded - verified up to " << cp.last_number << std::endl;
     }
     return cp;
 }
 
-void save_checkpoint(const Checkpoint& cp) {
+void saveCheckpoint(const Checkpoint& cp) {
     std::ofstream file("checkpoint.bin", std::ios::binary);
     if (file.is_open()) {
         file.write((char*)&cp, sizeof(Checkpoint));
@@ -91,35 +73,31 @@ void save_checkpoint(const Checkpoint& cp) {
     }
 }
 
-// ============================================================
-// UTILITY FUNCTIONS
-// ============================================================
-
-std::string format_time(double seconds) {
+std::string formatTime(double seconds) {
     if (seconds < 60) {
-        char buf[32];
+        char buf[64];
         snprintf(buf, sizeof(buf), "%.1fs", seconds);
         return std::string(buf);
     } else if (seconds < 3600) {
         int mins = (int)(seconds / 60);
         int secs = (int)(seconds) % 60;
-        char buf[32];
+        char buf[64];
         snprintf(buf, sizeof(buf), "%dm %ds", mins, secs);
         return std::string(buf);
     } else {
         int hours = (int)(seconds / 3600);
         int mins = (int)((int)(seconds) % 3600) / 60;
-        char buf[32];
+        char buf[64];
         snprintf(buf, sizeof(buf), "%dh %dm", hours, mins);
         return std::string(buf);
     }
 }
 
-// CPU fallback verification (for counterexample validation)
-uint32_t verify_number_cpu(uint64_t n, uint32_t max_steps) {
+// Used only for re-verifying a suspected counterexample on the CPU (rare).
+inline uint32_t verifyNumberCPU(uint64_t n, uint32_t maxSteps) {
+    unsigned __int128 x = (unsigned __int128)n;
     uint32_t steps = 0;
-    unsigned __int128 x = n;
-    while (x > 1 && steps < max_steps) {
+    while (x > 1 && steps < maxSteps) {
         if (x & 1) x = x * 3 + 1;
         else x = x >> 1;
         steps++;
@@ -127,316 +105,340 @@ uint32_t verify_number_cpu(uint64_t n, uint32_t max_steps) {
     return steps;
 }
 
-// ============================================================
-// GPU KERNEL DECLARATIONS
-// ============================================================
-
-extern "C" {
-    __global__ void generate_numbers_kernel(
-        uint64_t* numbers, uint64_t start, uint64_t count);
-    
-    __global__ void collatz_kernel(
-        const uint64_t* numbers, uint32_t* results, uint32_t* max_steps,
-        uint32_t max_limit, uint64_t count, uint64_t start_value);
-    
-    __global__ void reset_kernel_32(uint32_t* value);
-    __global__ void reset_kernel_64(uint64_t* value);
-    
-    __global__ void reduce_kernel(
-        const uint32_t* results, const uint64_t* numbers, uint64_t count,
-        uint64_t* out_verified, uint64_t* out_total_steps,
-        uint32_t* out_max_steps, uint64_t* out_max_number,
-        uint32_t* out_found);
+uint32_t calcSmallSteps(uint64_t n) {
+    uint32_t steps = 0;
+    while (n > 1 && steps < 100000) {
+        if (n & 1) n = n * 3 + 1;
+        else n = n >> 1;
+        steps++;
+    }
+    return steps;
 }
 
 // ============================================================
-// MAIN PROGRAM
+// Build the exact k-step acceleration table.
+// T(n) = n/2 (even) or (3n+1)/2 (odd). After TABLE_BITS applications:
+//   T^k(n) = (mul(r)*n + add(r)) >> k,   r = n mod 2^k
+// mul/add/steps depend only on r - proven by induction, see collatz.hip.
 // ============================================================
+static const uint32_t TABLE_BITS = 20;
+static const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
+
+void buildJumpTable(uint64_t* mul, uint64_t* add, uint32_t* steps) {
+    for (uint32_t r = 0; r < TABLE_SIZE; r++) {
+        unsigned __int128 curMul = 1, curAdd = 0;
+        uint64_t v = r;
+        uint64_t pow2i = 1;
+        uint32_t rawSteps = 0;
+        for (uint32_t i = 0; i < TABLE_BITS; i++) {
+            if (v & 1) {
+                curMul = curMul * 3;
+                curAdd = curAdd * 3 + pow2i;
+                v = (3 * v + 1) >> 1;
+                rawSteps += 2;
+            } else {
+                v = v >> 1;
+                rawSteps += 1;
+            }
+            pow2i <<= 1;
+        }
+        mul[r] = (uint64_t)curMul;
+        add[r] = (uint64_t)curAdd;
+        steps[r] = rawSteps;
+    }
+}
+
+extern "C" {
+    __global__ void collatzKernel(
+        uint64_t* numbers, uint32_t* results,
+        uint32_t maxStepsLimit, uint64_t numElements,
+        uint64_t startValue, const uint32_t* smallSteps,
+        const uint64_t* jumpMul, const uint64_t* jumpAdd, const uint32_t* jumpSteps
+    );
+    __global__ void generateNumbersKernel(uint64_t* numbers, uint64_t startNumber, uint64_t numElements);
+    __global__ void reduceResultsKernel(
+        uint32_t* results, uint64_t* numbers, uint64_t numElements,
+        uint64_t* outVerified, uint64_t* outTotalSteps,
+        uint32_t* outMaxSteps, uint64_t* outMaxNumber,
+        uint32_t* outFoundCounter
+    );
+}
+
+struct GPUResources {
+    uint64_t* d_numbers[2];
+    uint32_t* d_results[2];
+    uint64_t* d_outVerified[2];
+    uint64_t* d_outTotalSteps[2];
+    uint32_t* d_outMaxSteps[2];
+    uint64_t* d_outMaxNumber[2];
+    uint32_t* d_outFound[2];
+    hipStream_t streams[2];
+
+    uint32_t* d_smallSteps;
+    uint64_t* d_jumpMul;
+    uint64_t* d_jumpAdd;
+    uint32_t* d_jumpSteps;
+
+    uint32_t* h_smallSteps;
+    uint64_t* h_jumpMul;
+    uint64_t* h_jumpAdd;
+    uint32_t* h_jumpSteps;
+
+    int SMALL_TABLE_SIZE;
+};
+
+void cleanupGPU(GPUResources& res) {
+    for (int i = 0; i < 2; i++) {
+        if (res.d_numbers[i]) hipFree(res.d_numbers[i]);
+        if (res.d_results[i]) hipFree(res.d_results[i]);
+        if (res.d_outVerified[i]) hipFree(res.d_outVerified[i]);
+        if (res.d_outTotalSteps[i]) hipFree(res.d_outTotalSteps[i]);
+        if (res.d_outMaxSteps[i]) hipFree(res.d_outMaxSteps[i]);
+        if (res.d_outMaxNumber[i]) hipFree(res.d_outMaxNumber[i]);
+        if (res.d_outFound[i]) hipFree(res.d_outFound[i]);
+        if (res.streams[i]) hipStreamDestroy(res.streams[i]);
+    }
+    if (res.d_smallSteps) hipFree(res.d_smallSteps);
+    if (res.d_jumpMul) hipFree(res.d_jumpMul);
+    if (res.d_jumpAdd) hipFree(res.d_jumpAdd);
+    if (res.d_jumpSteps) hipFree(res.d_jumpSteps);
+}
+
+void initGPU(GPUResources& res, Config& config) {
+    for (int i = 0; i < 2; i++) {
+        HIP_CHECK(hipMalloc(&res.d_numbers[i], config.batchSize * sizeof(uint64_t)));
+        HIP_CHECK(hipMalloc(&res.d_results[i], config.batchSize * sizeof(uint32_t)));
+        HIP_CHECK(hipMalloc(&res.d_outVerified[i], sizeof(uint64_t)));
+        HIP_CHECK(hipMalloc(&res.d_outTotalSteps[i], sizeof(uint64_t)));
+        HIP_CHECK(hipMalloc(&res.d_outMaxSteps[i], sizeof(uint32_t)));
+        HIP_CHECK(hipMalloc(&res.d_outMaxNumber[i], sizeof(uint64_t)));
+        HIP_CHECK(hipMalloc(&res.d_outFound[i], sizeof(uint32_t)));
+        HIP_CHECK(hipStreamCreate(&res.streams[i]));
+    }
+
+    HIP_CHECK(hipMalloc(&res.d_smallSteps, res.SMALL_TABLE_SIZE * sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(res.d_smallSteps, res.h_smallSteps, res.SMALL_TABLE_SIZE * sizeof(uint32_t), hipMemcpyHostToDevice));
+
+    HIP_CHECK(hipMalloc(&res.d_jumpMul, TABLE_SIZE * sizeof(uint64_t)));
+    HIP_CHECK(hipMemcpy(res.d_jumpMul, res.h_jumpMul, TABLE_SIZE * sizeof(uint64_t), hipMemcpyHostToDevice));
+
+    HIP_CHECK(hipMalloc(&res.d_jumpAdd, TABLE_SIZE * sizeof(uint64_t)));
+    HIP_CHECK(hipMemcpy(res.d_jumpAdd, res.h_jumpAdd, TABLE_SIZE * sizeof(uint64_t), hipMemcpyHostToDevice));
+
+    HIP_CHECK(hipMalloc(&res.d_jumpSteps, TABLE_SIZE * sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(res.d_jumpSteps, res.h_jumpSteps, TABLE_SIZE * sizeof(uint32_t), hipMemcpyHostToDevice));
+}
 
 int main() {
-    // --- Banner ---
+    HIP_CHECK(hipSetDevice(0));
+    HIP_CHECK(hipDeviceSetLimit(hipLimitMallocHeapSize, 14ULL * 1024 * 1024 * 1024));
+
     printf("\033[2J\033[H");
     printf("============================================================\n");
-    printf("  COLLATZ CONJECTURE GPU VALIDATOR\n");
-    printf("  Radeon 9060XT | 2048 Cores | 3.74 Billion/sec\n");
+    printf("  AMD HIP Collatz Verifier (corrected)\n");
+    printf("  Exact k=%u bit acceleration table\n", TABLE_BITS);
     printf("============================================================\n\n");
 
-    // --- GPU Discovery ---
-    int device_count;
-    HIP_CHECK(hipGetDeviceCount(&device_count));
-    printf("[GPU] Found %d AMD GPU(s)\n", device_count);
-    
-    for (int i = 0; i < device_count; i++) {
+    const int SMALL_TABLE_SIZE = 65537;
+    uint32_t* h_smallSteps = new uint32_t[SMALL_TABLE_SIZE];
+    printf("[Info] Building small number lookup table (0-65536)...\n");
+    fflush(stdout);
+    for (int i = 0; i < SMALL_TABLE_SIZE; i++) {
+        h_smallSteps[i] = calcSmallSteps(i);
+    }
+
+    printf("[Info] Building exact k=%u acceleration table (%u entries)...\n", TABLE_BITS, TABLE_SIZE);
+    fflush(stdout);
+    uint64_t* h_jumpMul = new uint64_t[TABLE_SIZE];
+    uint64_t* h_jumpAdd = new uint64_t[TABLE_SIZE];
+    uint32_t* h_jumpSteps = new uint32_t[TABLE_SIZE];
+    buildJumpTable(h_jumpMul, h_jumpAdd, h_jumpSteps);
+    printf("[Info] All tables ready!\n\n");
+
+    Config config;
+    GPUResources res;
+    res.SMALL_TABLE_SIZE = SMALL_TABLE_SIZE;
+    res.h_smallSteps = h_smallSteps;
+    res.h_jumpMul = h_jumpMul;
+    res.h_jumpAdd = h_jumpAdd;
+    res.h_jumpSteps = h_jumpSteps;
+
+    initGPU(res, config);
+
+    int deviceCount;
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
+    printf("[GPU] Found %d AMD GPU(s)\n", deviceCount);
+    for (int i = 0; i < deviceCount; i++) {
         hipDeviceProp_t prop;
         HIP_CHECK(hipGetDeviceProperties(&prop, i));
-        printf("  %d: %s\n", i, prop.name);
-        printf("      Compute Units: %d\n", prop.multiProcessorCount);
-        printf("      Max Threads/Block: %d\n", prop.maxThreadsPerBlock);
+        printf("   GPU %d: %s\n", i, prop.name);
+        printf("   Compute Units: %d\n", prop.multiProcessorCount);
+        printf("   Max Threads/Block: %d\n", prop.maxThreadsPerBlock);
+        printf("   Warp size: %d\n", prop.warpSize);
     }
     printf("\n");
 
-    // --- Select GPU ---
-    int gpu_id = 0;
-    if (device_count > 1) {
-        printf("Select GPU (0-%d): ", device_count - 1);
-        std::cin >> gpu_id;
-    }
-    HIP_CHECK(hipSetDevice(gpu_id));
-
-    // --- Display Configuration ---
-    size_t free_mem, total_mem;
-    HIP_CHECK(hipMemGetInfo(&free_mem, &total_mem));
-    printf("[Config] Free VRAM: %zu GB\n", free_mem / (1024ULL * 1024 * 1024));
-    printf("[Config] Batch Size: %lluM numbers\n", Config::BATCH_SIZE / (1024ULL * 1024));
-    printf("[Config] Buffers: %d\n", Config::NUM_BUFFERS);
-    printf("[Config] Threads/Block: %d\n", Config::THREADS_PER_BLOCK);
+    printf("[Info] Batch size: %lluM numbers/batch (x2 buffers)\n", (unsigned long long)(config.batchSize / (1024*1024)));
+    printf("[Info] Acceleration table: %u bits (~%.1f MB)\n", TABLE_BITS,
+           (double)(TABLE_SIZE * (8+8+4)) / (1024*1024));
     printf("\n");
 
-    // --- Load Checkpoint ---
-    Checkpoint cp = load_checkpoint();
-    uint64_t current_number = cp.last_number;
-    uint64_t total_verified = cp.total_verified;
-    uint64_t total_steps = cp.total_steps;
-    uint32_t max_steps = cp.max_steps;
-    uint64_t max_steps_number = cp.max_steps_number;
-    uint64_t batch_count = cp.batch_count;
-    uint64_t total_real_verified = cp.total_real_verified;
-    uint64_t start_value = current_number;
+    Checkpoint cp = loadCheckpoint();
+    uint64_t currentNumber = cp.lastNumber;
+    uint64_t totalVerified = cp.totalVerified;
+    uint64_t totalSteps = cp.totalSteps;
+    uint32_t maxSteps = cp.maxSteps;
+    uint64_t maxStepsNumber = cp.maxStepsNumber;
+    uint64_t batchCount = cp.batchCount;
+    uint64_t totalRealVerified = cp.totalRealVerified;
 
-    printf("[Info] Starting from: %llu\n", current_number);
+    if (totalRealVerified < currentNumber - 1) totalRealVerified = currentNumber - 1;
+    if (totalRealVerified == 0 && currentNumber > 1) totalRealVerified = currentNumber - 1;
+    if (totalVerified > totalRealVerified) totalVerified = totalRealVerified;
+
+    printf("[Info] Starting from: %llu\n", (unsigned long long)currentNumber);
     printf("============================================================\n\n");
 
-    // --- Allocate GPU Memory (Double Buffering) ---
-    const int NUM_BUFS = Config::NUM_BUFFERS;
-    
-    uint64_t* dev_numbers[NUM_BUFS];
-    uint32_t* dev_results[NUM_BUFS];
-    uint32_t* dev_max_steps[NUM_BUFS];
-    uint64_t* dev_max_number[NUM_BUFS];
-    uint32_t* dev_found[NUM_BUFS];
-    
-    uint64_t* dev_out_verified[NUM_BUFS];
-    uint64_t* dev_out_total_steps[NUM_BUFS];
-    uint32_t* dev_out_max_steps[NUM_BUFS];
-    uint64_t* dev_out_max_number[NUM_BUFS];
-    uint32_t* dev_out_found[NUM_BUFS];
-    
-    hipStream_t streams[NUM_BUFS];
-    
-    for (int i = 0; i < NUM_BUFS; i++) {
-        HIP_CHECK(hipMalloc(&dev_numbers[i], Config::BATCH_SIZE * sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&dev_results[i], Config::BATCH_SIZE * sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&dev_max_steps[i], sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&dev_max_number[i], sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&dev_found[i], sizeof(uint32_t)));
-        
-        HIP_CHECK(hipMalloc(&dev_out_verified[i], sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&dev_out_total_steps[i], sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&dev_out_max_steps[i], sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&dev_out_max_number[i], sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&dev_out_found[i], sizeof(uint32_t)));
-        
-        HIP_CHECK(hipStreamCreate(&streams[i]));
-    }
+    auto startTime = std::chrono::high_resolution_clock::now();
+    auto lastDisplay = startTime;
+    uint64_t lastVerified = totalRealVerified;
+    bool foundCounterExample = false;
+    uint64_t counterExampleNumber = 0;
+    uint64_t startValue = currentNumber;
+    int activeBuffer = 0;
+    bool hasPending = false;
 
-    // --- Runtime State ---
-    auto start_time = std::chrono::high_resolution_clock::now();
-    auto last_display = start_time;
-    uint64_t last_verified = total_real_verified;
-    bool found_counterexample = false;
-    uint64_t counterexample_number = 0;
-    
-    int active_buffer = 0;
-    bool has_pending = false;
+    const int threads = 256;
 
     printf("Running...\n\n");
 
-    // --- Main Loop ---
     while (true) {
-        batch_count++;
-        uint64_t batch_start = current_number;
-        
-        // Calculate grid dimensions
-        int threads = Config::THREADS_PER_BLOCK;
-        int blocks = (Config::BATCH_SIZE + threads - 1) / threads;
-        if (blocks > 65535) {
-            threads = 512;
-            blocks = (Config::BATCH_SIZE + threads - 1) / threads;
-        }
-        if (blocks > 65535) {
-            threads = 1024;
-            blocks = (Config::BATCH_SIZE + threads - 1) / threads;
-        }
+        batchCount++;
 
-        int buf = active_buffer;
+        uint64_t batchStart = currentNumber;
+        uint64_t blocks64 = (config.batchSize + threads - 1) / threads;
 
-        // --- Launch Kernels ---
-        
-        // 1. Generate numbers
-        hipLaunchKernelGGL(generate_numbers_kernel, blocks, threads, 0, streams[buf],
-                           dev_numbers[buf], batch_start, Config::BATCH_SIZE);
+        int buf = activeBuffer;
+
+        hipLaunchKernelGGL(generateNumbersKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
+                           res.d_numbers[buf], batchStart, config.batchSize);
         HIP_CHECK(hipGetLastError());
 
-        // 2. Reset statistics
-        hipLaunchKernelGGL(reset_kernel_32, 1, 1, 0, streams[buf], dev_max_steps[buf]);
-        hipLaunchKernelGGL(reset_kernel_64, 1, 1, 0, streams[buf], dev_max_number[buf]);
-        hipLaunchKernelGGL(reset_kernel_32, 1, 1, 0, streams[buf], dev_found[buf]);
-        
-        hipLaunchKernelGGL(reset_kernel_64, 1, 1, 0, streams[buf], dev_out_verified[buf]);
-        hipLaunchKernelGGL(reset_kernel_64, 1, 1, 0, streams[buf], dev_out_total_steps[buf]);
-        hipLaunchKernelGGL(reset_kernel_32, 1, 1, 0, streams[buf], dev_out_max_steps[buf]);
-        hipLaunchKernelGGL(reset_kernel_64, 1, 1, 0, streams[buf], dev_out_max_number[buf]);
-        hipLaunchKernelGGL(reset_kernel_32, 1, 1, 0, streams[buf], dev_out_found[buf]);
+        HIP_CHECK(hipMemsetAsync(res.d_outVerified[buf], 0, sizeof(uint64_t), res.streams[buf]));
+        HIP_CHECK(hipMemsetAsync(res.d_outTotalSteps[buf], 0, sizeof(uint64_t), res.streams[buf]));
+        HIP_CHECK(hipMemsetAsync(res.d_outMaxSteps[buf], 0, sizeof(uint32_t), res.streams[buf]));
+        HIP_CHECK(hipMemsetAsync(res.d_outMaxNumber[buf], 0, sizeof(uint64_t), res.streams[buf]));
+        HIP_CHECK(hipMemsetAsync(res.d_outFound[buf], 0, sizeof(uint32_t), res.streams[buf]));
+
+        hipLaunchKernelGGL(collatzKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
+                           res.d_numbers[buf], res.d_results[buf],
+                           config.maxSteps, config.batchSize, startValue,
+                           res.d_smallSteps, res.d_jumpMul, res.d_jumpAdd, res.d_jumpSteps);
         HIP_CHECK(hipGetLastError());
 
-        // 3. Collatz computation
-        hipLaunchKernelGGL(collatz_kernel, blocks, threads, 0, streams[buf],
-                           dev_numbers[buf], dev_results[buf], dev_max_steps[buf],
-                           Config::MAX_STEPS, Config::BATCH_SIZE, start_value);
+        hipLaunchKernelGGL(reduceResultsKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
+                           res.d_results[buf], res.d_numbers[buf], config.batchSize,
+                           res.d_outVerified[buf], res.d_outTotalSteps[buf],
+                           res.d_outMaxSteps[buf], res.d_outMaxNumber[buf],
+                           res.d_outFound[buf]);
         HIP_CHECK(hipGetLastError());
 
-        // 4. GPU Reduction
-        int reduce_blocks = (Config::BATCH_SIZE + threads - 1) / threads;
-        hipLaunchKernelGGL(reduce_kernel, reduce_blocks, threads, 0, streams[buf],
-                           dev_results[buf], dev_numbers[buf], Config::BATCH_SIZE,
-                           dev_out_verified[buf], dev_out_total_steps[buf],
-                           dev_out_max_steps[buf], dev_out_max_number[buf],
-                           dev_out_found[buf]);
-        HIP_CHECK(hipGetLastError());
+        if (hasPending) {
+            int prevBuf = (buf == 0) ? 1 : 0;
+            HIP_CHECK(hipStreamSynchronize(res.streams[prevBuf]));
 
-        // --- Process Previous Buffer (Double Buffering) ---
-        if (has_pending) {
-            int prev_buf = (buf + Config::NUM_BUFFERS - 1) % Config::NUM_BUFFERS;
-            
-            HIP_CHECK(hipStreamSynchronize(streams[prev_buf]));
-            
-            // Read only 5 numbers from GPU!
-            uint64_t h_out_verified, h_out_total_steps, h_out_max_number;
-            uint32_t h_out_max_steps;
-            uint32_t h_out_found;
-            
-            HIP_CHECK(hipMemcpy(&h_out_verified, dev_out_verified[prev_buf], sizeof(uint64_t),
-                                hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(&h_out_total_steps, dev_out_total_steps[prev_buf], sizeof(uint64_t),
-                                hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(&h_out_max_steps, dev_out_max_steps[prev_buf], sizeof(uint32_t),
-                                hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(&h_out_max_number, dev_out_max_number[prev_buf], sizeof(uint64_t),
-                                hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(&h_out_found, dev_out_found[prev_buf], sizeof(uint32_t),
-                                hipMemcpyDeviceToHost));
+            uint64_t h_outVerified, h_outTotalSteps, h_outMaxNumber;
+            uint32_t h_outMaxSteps;
+            uint32_t h_outFound;
 
-            // Validate counterexample (CPU fallback)
-            if (h_out_found != 0) {
-                uint32_t real_steps = verify_number_cpu(h_out_max_number, Config::MAX_STEPS);
-                if (real_steps >= Config::MAX_STEPS) {
-                    found_counterexample = true;
-                    counterexample_number = h_out_max_number;
-                    printf("\n[!!!] COUNTEREXAMPLE FOUND: %llu\n", counterexample_number);
+            HIP_CHECK(hipMemcpy(&h_outVerified, res.d_outVerified[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_outTotalSteps, res.d_outTotalSteps[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_outMaxSteps, res.d_outMaxSteps[prevBuf], sizeof(uint32_t), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_outMaxNumber, res.d_outMaxNumber[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_outFound, res.d_outFound[prevBuf], sizeof(uint32_t), hipMemcpyDeviceToHost));
+
+            if (h_outFound != 0) {
+                uint32_t realSteps = verifyNumberCPU(h_outMaxNumber, config.maxSteps);
+                if (realSteps >= config.maxSteps) {
+                    foundCounterExample = true;
+                    counterExampleNumber = h_outMaxNumber;
+                    printf("\n[!!!] REAL COUNTEREXAMPLE FOUND: %llu\n", (unsigned long long)counterExampleNumber);
                     break;
                 }
             }
 
-            // Update global statistics
-            total_verified += h_out_verified;
-            total_steps += h_out_total_steps;
-            total_real_verified += Config::BATCH_SIZE;
-            
-            if (h_out_max_steps > max_steps) {
-                max_steps = h_out_max_steps;
-                max_steps_number = h_out_max_number;
+            totalVerified += h_outVerified;
+            totalSteps += h_outTotalSteps;
+            totalRealVerified += config.batchSize;
+            if (h_outMaxSteps > maxSteps) {
+                maxSteps = h_outMaxSteps;
+                maxStepsNumber = h_outMaxNumber;
             }
-            
-            current_number += Config::BATCH_SIZE;
-            start_value = current_number;
-            has_pending = false;
+            currentNumber += config.batchSize;
+            startValue = currentNumber;
+            hasPending = false;
         }
 
-        // --- Switch Buffer ---
-        active_buffer = (active_buffer + 1) % Config::NUM_BUFFERS;
-        has_pending = true;
+        activeBuffer = (activeBuffer + 1) % 2;
+        hasPending = true;
 
-        // --- Display Progress ---
         auto now = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(now - last_display).count();
-        
+        double elapsed = std::chrono::duration<double>(now - lastDisplay).count();
+
         if (elapsed >= 0.3) {
-            double real_speed = (double)(total_real_verified - last_verified) / elapsed;
-            double total_elapsed = std::chrono::duration<double>(now - start_time).count();
-            
+            double realSpeed = (double)(totalRealVerified - lastVerified) / elapsed;
+            double totalElapsed = std::chrono::duration<double>(now - startTime).count();
+
             printf("\033[H");
             printf("============================================================\n");
-            printf("  COLLATZ GPU VALIDATOR\n");
-            printf("  Speed: %.0f numbers/sec\n", real_speed);
-            printf("============================================================\n");
-            printf("\n");
-            printf("  Batch:      %llu\n", batch_count);
-            printf("  Verified to: %llu\n", current_number);
-            printf("  Total:      %llu\n", total_verified);
-            printf("  Max Steps:  %u (number %llu)\n", max_steps, max_steps_number);
-            printf("  Time:       %s\n", format_time(total_elapsed).c_str());
+            printf("  AMD HIP Collatz Verifier (corrected)\n");
+            printf("  Speed: %.0f numbers/sec\n", realSpeed);
+            printf("============================================================\n\n");
+            printf("  Batch:      %llu\n", (unsigned long long)batchCount);
+            printf("  Verified to: %llu\n", (unsigned long long)currentNumber);
+            printf("  Total:      %llu\n", (unsigned long long)totalVerified);
+            printf("  Max Steps:  %u (number %llu)\n", maxSteps, (unsigned long long)maxStepsNumber);
+            printf("  Time:       %s\n", formatTime(totalElapsed).c_str());
             printf("============================================================\n");
             fflush(stdout);
 
-            last_display = now;
-            last_verified = total_real_verified;
+            lastDisplay = now;
+            lastVerified = totalRealVerified;
         }
 
-        // --- Checkpoint ---
-        if (batch_count % Config::SAVE_INTERVAL == 0) {
-            Checkpoint new_cp = {
-                current_number, total_verified, total_steps,
-                max_steps, max_steps_number, batch_count,
-                0, start_value, total_real_verified
-            };
-            save_checkpoint(new_cp);
+        if (batchCount % config.saveInterval == 0) {
+            Checkpoint newCp = {currentNumber, totalVerified, totalSteps,
+                               maxSteps, maxStepsNumber, batchCount, 0, startValue, totalRealVerified};
+            saveCheckpoint(newCp);
         }
 
-        // --- Safety Check ---
-        if (current_number > UINT64_MAX - Config::BATCH_SIZE) {
+        if (currentNumber > UINT64_MAX - config.batchSize) {
             printf("\n[Warning] Reached 64-bit limit\n");
             break;
         }
     }
 
-    // --- Final Statistics ---
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double total_seconds = std::chrono::duration<double>(end_time - start_time).count();
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double totalSeconds = std::chrono::duration<double>(endTime - startTime).count();
 
     printf("\n\n============================================================\n");
     printf("  VERIFICATION COMPLETE\n");
     printf("============================================================\n");
-    printf("  Verified up to: %llu\n", current_number);
-    printf("  Total verified: %llu\n", total_verified);
-    printf("  Record max steps: %u (number %llu)\n", max_steps, max_steps_number);
-    printf("  Runtime: %s\n", format_time(total_seconds).c_str());
-    
-    if (total_seconds > 0) {
-        double avg_speed = total_real_verified / total_seconds;
-        printf("  Average speed: %.0f numbers/sec\n", avg_speed);
+    printf("[OK] Verified up to: %llu\n", (unsigned long long)currentNumber);
+    printf("[OK] Total verified: %llu\n", (unsigned long long)totalVerified);
+    printf("[Best] Max steps: %u (number %llu)\n", maxSteps, (unsigned long long)maxStepsNumber);
+    printf("[Time] Total time: %s\n", formatTime(totalSeconds).c_str());
+
+    if (totalSeconds > 0) {
+        double avgRealSpeed = totalRealVerified / totalSeconds;
+        printf("[Speed] Real speed: %d numbers/sec\n", (int)avgRealSpeed);
     }
 
-    if (found_counterexample) {
-        printf("\n  [!!!] COUNTEREXAMPLE FOUND: %llu\n", counterexample_number);
-    } else {
-        printf("\n  [OK] All numbers up to %llu converge to 1.\n", current_number);
-    }
-    printf("============================================================\n");
-
-    // --- Cleanup ---
-    for (int i = 0; i < Config::NUM_BUFFERS; i++) {
-        HIP_CHECK(hipFree(dev_numbers[i]));
-        HIP_CHECK(hipFree(dev_results[i]));
-        HIP_CHECK(hipFree(dev_max_steps[i]));
-        HIP_CHECK(hipFree(dev_max_number[i]));
-        HIP_CHECK(hipFree(dev_found[i]));
-        HIP_CHECK(hipFree(dev_out_verified[i]));
-        HIP_CHECK(hipFree(dev_out_total_steps[i]));
-        HIP_CHECK(hipFree(dev_out_max_steps[i]));
-        HIP_CHECK(hipFree(dev_out_max_number[i]));
-        HIP_CHECK(hipFree(dev_out_found[i]));
-        HIP_CHECK(hipStreamDestroy(streams[i]));
-    }
+    cleanupGPU(res);
+    delete[] h_smallSteps;
+    delete[] h_jumpMul;
+    delete[] h_jumpAdd;
+    delete[] h_jumpSteps;
 
     return 0;
 }

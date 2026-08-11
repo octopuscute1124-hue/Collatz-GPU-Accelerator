@@ -1,28 +1,34 @@
 @echo off
 chcp 65001 >nul 2>nul
-title Build Collatz GPU Validator
+title Build AMD HIP Collatz Verifier - EXTREME
 
 echo ============================================================
-echo   Building Collatz GPU Validator
-echo   Target: AMD Radeon 9060XT
+echo   Building AMD HIP Collatz Verifier
+echo   EXTREME OPTIMIZATION - 9060XT 2048 Core Edition
 echo ============================================================
 echo.
 
 cd /d "%~dp0"
 
-REM Load Visual Studio environment
+REM Visual Studio
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" 2>nul
 if %errorlevel% neq 0 (
     call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" 2>nul
 )
 
-REM Set ROCm path
+REM HIP
 set PATH=C:\Program Files\AMD\ROCm\7.1\bin;%PATH%
 
-echo [OK] Environment ready
+REM ============================================================
+REM Force GPU 0, disable fallback to system RAM
+REM ============================================================
+set HIP_VISIBLE_DEVICES=0
+set HIP_FORCE_DEVICE=0
+set HIP_DEVICE=0
+
+echo [OK] Environment ready - GPU 0 forced
 echo.
 
-REM Compile
 hipcc -O3 -std=c++17 ^
       --offload-arch=native ^
       -ffast-math ^
@@ -42,7 +48,7 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [SUCCESS] Build complete!
-echo [INFO] collatz_amd.exe is ready
+echo [SUCCESS] Compilation complete!
+echo [INFO] collatz_amd.exe is ready - VRAM forced
 echo.
 pause

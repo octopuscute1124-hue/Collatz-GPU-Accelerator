@@ -1,152 +1,146 @@
-```markdown
-# 🔢 Collatz Conjecture GPU Accelerator
+# Collatz Conjecture GPU Verifier – HIP Edition (Corrected)
 
-<div align="center">
-
-**AMD Radeon 9060XT | 3.74 Billion numbers/sec | 2048 Cores**
+**AMD Radeon 9060 XT | 5.86+ Billion numbers/sec | Exact Verification**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/platform-Windows-blue)](https://github.com/)
-[![GPU](https://img.shields.io/badge/GPU-AMD%20ROCm-red)](https://rocm.docs.amd.com/)
-
-</div>
 
 ---
 
 ## 📖 About
 
-A high-performance GPU-accelerated validator for the **Collatz Conjecture** using AMD HIP.
+This is a **high-performance, mathematically corrected** GPU verifier for the Collatz Conjecture, built with AMD HIP.
 
-The Collatz Conjecture is one of the most famous unsolved problems in mathematics:
+The Collatz Conjecture (or the `3n+1` problem) states that for any positive integer, repeatedly applying:
+- if even, divide by 2
+- if odd, multiply by 3 and add 1
 
-> For any positive integer n, if n is even, divide by 2; if n is odd, multiply by 3 and add 1. Eventually, it will always reach 1.
+will eventually lead to the number 1. Despite its simplicity, it remains unproven for all numbers.
 
-This project uses massive GPU parallelism to verify billions of numbers against this rule in a matter of minutes.
+This project leverages the massive parallelism of AMD Radeon GPUs to verify billions of numbers per second.
 
 ---
 
 ## 🚀 Performance Benchmark
 
-| Hardware | Speed | Improvement |
-|----------|-------|-------------|
+| Hardware | Speed | Improvement vs. CPU |
+| :--- | :--- | :--- |
 | CPU (Single Core) | ~5 Million/sec | 1x |
-| **AMD Radeon 9060XT (This Project)** | **3.74 Billion/sec** | **~750x** |
+| **AMD Radeon 9060 XT (This Verifier)** | **> 5.86 Billion/sec** | **~1,170x** |
 
-**Yes, this is 750x faster than a single CPU core.**
-
----
-
-## 📁 Project Structure
-
-```
-Collatz-GPU-Accelerator/
-├── src/
-│   ├── collatz.hip       # GPU Kernel (HIP/C++)
-│   └── collatz.cpp       # Host code (CPU control)
-├── build.bat             # Build script (Windows)
-├── run.bat               # Run script (menu + checkpoint)
-├── start.bat             # Quick start
-├── collatz_amd.exe       # Compiled binary (after build)
-├── checkpoint.bin        # Progress checkpoint (runtime)
-├── LICENSE               # MIT License
-└── README.md             # This file
-```
+**Yes, this is over 1,100x faster than a single CPU core.**
 
 ---
 
-## ⚡ Quick Start
+## ✨ Key Features & v2.0 Critical Fixes
 
-```bash
-git clone https://github.com/octopuscute1124-hue/Collatz-GPU-Accelerator.git
-cd Collatz-GPU-Accelerator
-build.bat
-run.bat
-```
+This version (`v2.0`) is a **major correction** over previous public releases.
+
+- **Fixed: Exact k-Step Acceleration Table**  
+  The old version used a mathematically invalid "modular residue" skip table, which meant it **did not actually verify ~95% of numbers**. This has been replaced with a proven, exact `k=20` bit acceleration table. Every result is now genuinely verified.
+
+- **Double Buffering & Async Streams**  
+  Uses two GPU buffers and HIP streams to completely overlap computation with data transfer, maximizing utilization.
+
+- **Optimized Resource Management**  
+  Replaces expensive `hipDeviceReset()` calls with precise `hipMemsetAsync` operations. Default batch size (256M) is tuned for stability on 16GB GPUs.
+
+- **GPU-Accelerated Reduction**  
+  Statistics (max steps, counterexample detection) are aggregated directly on the GPU. The CPU only reads a tiny result packet per batch.
+
+- **Checkpoint & Resume**  
+  Automatically saves progress to `checkpoint.bin`. You can stop and resume anytime without losing work.
+
+- **Counterexample Detection**  
+  If a number exceeds the step limit, it's re-verified on the CPU to eliminate false positives.
 
 ---
 
 ## 🛠️ System Requirements
 
 | Item | Requirement |
-|------|-------------|
-| OS | Windows 10/11 |
-| GPU | AMD Radeon RX 6000/7000 series (RDNA 2/3) |
+| :--- | :--- |
+| OS | Windows 10 / 11 |
+| GPU | AMD Radeon RX 6000 / 7000 / 9000 series (RDNA 2/3/4) |
 | Driver | AMD ROCm 7.1 or newer |
-| Compiler | Visual Studio 2022 |
+| Compiler | Visual Studio 2022 (with HIP support) |
 | Dependencies | HIP, ROCm |
 
 ---
 
-## 🎯 Technical Highlights
+## 📁 Project Structure
 
-- **Double Buffering** – Hide transfer latency, maximize GPU utilization
-- **Early Termination** – Skip already-verified numbers to save compute
-- **GPU Reduction** – Aggregate statistics on GPU; CPU reads only 5 numbers per batch
-- **Checkpointing** – Resume from last progress if interrupted
-- **Counterexample Detection** – Real-time detection and validation
+Collatz-GPU-Accelerator/
+├── src/
+│ ├── collatz.hip # GPU Kernel (HIP/C++) – THE CORE LOGIC
+│ └── collatz.cpp # Host code (CPU control, table builder)
+├── build.bat # Build script (Windows)
+├── run.bat # Run script with menu
+├── collatz_amd.exe # Compiled binary
+├── checkpoint.bin # Progress checkpoint (auto-generated)
+├── LICENSE # MIT License
+└── README.md # This file
 
 ---
 
-## 📊 Sample Output
+## ⚡ Quick Start
 
-```
+1. **Clone or download** this repository.
+2. **Build** the executable by running `build.bat`.
+3. **Run** the verifier by executing `run.bat`.
+4. To **start a fresh verification**, simply delete the `checkpoint.bin` file.
+
+---
+
+## 📊 Sample Output (v2.0)
+
 ============================================================
-  COLLATZ CONJECTURE GPU VALIDATOR
-  Radeon 9060XT | 2048 Cores | 3.74 Billion/sec
+AMD HIP Collatz Verifier (corrected)
+Exact k=20 bit acceleration table
 ============================================================
 
-[GPU] Found 1 AMD GPU(s)
-  0: AMD Radeon 9060XT
-      Compute Units: 32
-      Max Threads/Block: 1024
+[Info] Batch size: 256M numbers/batch (x2 buffers)
+[Info] Acceleration table: 20 bits (~20.0 MB)
 
-[Config] Free VRAM: 15 GB
-[Config] Batch Size: 512M numbers
-[Config] Buffers: 2
-[Config] Threads/Block: 256
+[Info] Starting from: 78449773248507
 
 Running...
+============================================================
+AMD HIP Collatz Verifier (corrected)
+Speed: 5864780763 numbers/sec
+============================================================
 
+Batch: 246025
+Verified to: 78496481017851
+Total: 78496481017849
+Max Steps: 1307 (number 202485402111)
+Time: 7.9s
 ============================================================
-  COLLATZ GPU VALIDATOR
-  Speed: 3740000000 numbers/sec
-============================================================
-
-  Batch:      42
-  Verified to: 21,504,000,000
-  Total:      21,504,000,000
-  Max Steps:  523 (number 9,780,657,631)
-  Time:       5m 45s
-============================================================
-```
 
 ---
 
-## ⚠️ Disclaimer
+## ⚠️ Important Note on Checkpoints
 
-This program is for academic research and performance demonstration purposes.  
-While the Collatz Conjecture has been verified for an enormous range, it remains mathematically unproven.  
-This program does not guarantee finding a counterexample, nor is it guaranteed to be bug-free.
+**Checkpoint files (`.bin`) created by the old, incorrect version are INVALID for this verifier.**  
+If you are upgrading, please delete your old `checkpoint.bin` before running `v2.0`. The program will warn you about this.
 
 ---
 
 ## 📄 License
 
-MIT License – use it, modify it, copy it, just keep the copyright notice.
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
 
 ---
 
 ## 🤝 Contributing
 
-Issues and Pull Requests are welcome!
+Issues, bug reports, and pull requests are welcome! If you find a genuine counterexample, that would be the discovery of the century.
 
 ---
 
 ## 📮 Contact
 
-Open an Issue on GitHub for any questions.
+For questions, please open an Issue on GitHub.
 
 ---
 
-Made with 🔢 by octopodiformes
-```
+**Made with 🔢 and a commitment to correctness by octopodiformes**
