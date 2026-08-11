@@ -70,14 +70,23 @@ This version (`v2.0`) is a **major correction** over previous public releases.
 ## 📁 Project Structure
 
 Collatz-GPU-Accelerator/
+
 ├── src/
+
 │ ├── collatz.hip # GPU Kernel (HIP/C++) – THE CORE LOGIC
+
 │ └── collatz.cpp # Host code (CPU control, table builder)
+
 ├── build.bat # Build script (Windows)
+
 ├── run.bat # Run script with menu
+
 ├── collatz_amd.exe # Compiled binary
+
 ├── checkpoint.bin # Progress checkpoint (auto-generated)
+
 ├── LICENSE # MIT License
+
 └── README.md # This file
 
 ---
@@ -91,7 +100,7 @@ Collatz-GPU-Accelerator/
 
 ---
 
-## 📊 Sample Output (v2.0)
+📊 Sample Output (v2.0)
 
 ============================================================
 AMD HIP Collatz Verifier (corrected)
