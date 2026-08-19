@@ -18,6 +18,7 @@ if %errorlevel% neq 0 (
 
 REM HIP
 set PATH=C:\Program Files\AMD\ROCm\7.1\bin;%PATH%
+set HIP_PATH=C:\Program Files\AMD\ROCm\7.1
 
 REM ============================================================
 REM Force GPU 0, disable fallback to system RAM

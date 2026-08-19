@@ -1,21 +1,15 @@
 /**
- * collatz.cpp - Corrected Collatz verifier host code
+ * collatz.cpp - Host code for the AMD HIP Collatz verifier
  *
- * Fixes vs. the original:
- *   - Replaced the mathematically invalid "modular residue" skip table
- *     with an exact k-step Collatz acceleration table (see collatz.hip
- *     for the derivation). This is the single most important fix: the
- *     old code was not actually verifying ~95% of numbers.
- *   - Removed the periodic hipDeviceReset() (very expensive, and not
- *     needed - alloc/free was already paired correctly).
- *   - Replaced 5 single-thread "reset" kernel launches per batch with
- *     hipMemsetAsync.
- *   - Reduced default batch size to fit comfortably in 16GB with a
- *     large safety margin (previous default used 12+GB of VRAM by itself).
+ * Core algorithm: exact k-step Terras/Everett acceleration table.
  *
- * IMPORTANT: any checkpoint.bin produced by the old binary encodes
- * progress that was never actually verified for most numbers. Delete
- * checkpoint.bin before running this version.
+ * Key optimizations (see collatz.hip for kernel details):
+ *   - Odd-only verification (even n=2m is covered by Collatz(m))
+ *   - 8-byte packed jump table (add|mul|steps in one uint64)
+ *   - k=18 table (2 MB) fully resident in L2 cache
+ *   - Double-buffered async streams with GPU-side reduction
+ *   - Checkpoint/resume support
+ *   - Counterexample detection with CPU re-verification
  */
 
 #include <iostream>
@@ -38,7 +32,7 @@
     } while(0)
 
 struct Config {
-    uint64_t batchSize = 256ull * 1024 * 1024;   // 256M numbers/batch (~6GB VRAM w/ double buffer)
+    uint64_t batchSize = 1024ull * 1024 * 1024;   // 1G odd numbers/batch
     uint32_t maxSteps = 100000;
     int saveInterval = 10;
 };
@@ -105,26 +99,22 @@ inline uint32_t verifyNumberCPU(uint64_t n, uint32_t maxSteps) {
     return steps;
 }
 
-uint32_t calcSmallSteps(uint64_t n) {
-    uint32_t steps = 0;
-    while (n > 1 && steps < 100000) {
-        if (n & 1) n = n * 3 + 1;
-        else n = n >> 1;
-        steps++;
-    }
-    return steps;
-}
-
 // ============================================================
 // Build the exact k-step acceleration table.
 // T(n) = n/2 (even) or (3n+1)/2 (odd). After TABLE_BITS applications:
 //   T^k(n) = (mul(r)*n + add(r)) >> k,   r = n mod 2^k
-// mul/add/steps depend only on r - proven by induction, see collatz.hip.
+// mul/add/steps depend only on r - proven by induction.
+// Each entry is bit-packed into a uint64: add(29b)|mul(29b)|steps(6b).
 // ============================================================
-static const uint32_t TABLE_BITS = 20;
+static const uint32_t TABLE_BITS = 18;
 static const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
 
-void buildJumpTable(uint64_t* mul, uint64_t* add, uint32_t* steps) {
+// v9: bit-packed entry – add(29b)+mul(29b)+steps(6b)=64b
+#define ADD_MASK   0x1FFFFFFFull
+#define MUL_SHIFT  29
+#define STEP_SHIFT 58
+
+void buildJumpTable(uint64_t* table) {
     for (uint32_t r = 0; r < TABLE_SIZE; r++) {
         unsigned __int128 curMul = 1, curAdd = 0;
         uint64_t v = r;
@@ -142,22 +132,16 @@ void buildJumpTable(uint64_t* mul, uint64_t* add, uint32_t* steps) {
             }
             pow2i <<= 1;
         }
-        mul[r] = (uint64_t)curMul;
-        add[r] = (uint64_t)curAdd;
-        steps[r] = rawSteps;
+        table[r] = ((uint64_t)rawSteps << STEP_SHIFT)
+                 | ((uint64_t)(uint32_t)curMul << MUL_SHIFT)
+                 | (uint64_t)(uint32_t)curAdd;
     }
 }
 
 extern "C" {
     __global__ void collatzKernel(
-        uint64_t* numbers, uint32_t* results,
-        uint32_t maxStepsLimit, uint64_t numElements,
-        uint64_t startValue, const uint32_t* smallSteps,
-        const uint64_t* jumpMul, const uint64_t* jumpAdd, const uint32_t* jumpSteps
-    );
-    __global__ void generateNumbersKernel(uint64_t* numbers, uint64_t startNumber, uint64_t numElements);
-    __global__ void reduceResultsKernel(
-        uint32_t* results, uint64_t* numbers, uint64_t numElements,
+        uint32_t maxStepsLimit, uint64_t numElements, uint64_t startValue,
+        const uint64_t* jumpTable,
         uint64_t* outVerified, uint64_t* outTotalSteps,
         uint32_t* outMaxSteps, uint64_t* outMaxNumber,
         uint32_t* outFoundCounter
@@ -165,8 +149,6 @@ extern "C" {
 }
 
 struct GPUResources {
-    uint64_t* d_numbers[2];
-    uint32_t* d_results[2];
     uint64_t* d_outVerified[2];
     uint64_t* d_outTotalSteps[2];
     uint32_t* d_outMaxSteps[2];
@@ -174,23 +156,12 @@ struct GPUResources {
     uint32_t* d_outFound[2];
     hipStream_t streams[2];
 
-    uint32_t* d_smallSteps;
-    uint64_t* d_jumpMul;
-    uint64_t* d_jumpAdd;
-    uint32_t* d_jumpSteps;
-
-    uint32_t* h_smallSteps;
-    uint64_t* h_jumpMul;
-    uint64_t* h_jumpAdd;
-    uint32_t* h_jumpSteps;
-
-    int SMALL_TABLE_SIZE;
+    uint64_t* d_jumpTable;
+    uint64_t* h_jumpTable;
 };
 
 void cleanupGPU(GPUResources& res) {
     for (int i = 0; i < 2; i++) {
-        if (res.d_numbers[i]) hipFree(res.d_numbers[i]);
-        if (res.d_results[i]) hipFree(res.d_results[i]);
         if (res.d_outVerified[i]) hipFree(res.d_outVerified[i]);
         if (res.d_outTotalSteps[i]) hipFree(res.d_outTotalSteps[i]);
         if (res.d_outMaxSteps[i]) hipFree(res.d_outMaxSteps[i]);
@@ -198,16 +169,11 @@ void cleanupGPU(GPUResources& res) {
         if (res.d_outFound[i]) hipFree(res.d_outFound[i]);
         if (res.streams[i]) hipStreamDestroy(res.streams[i]);
     }
-    if (res.d_smallSteps) hipFree(res.d_smallSteps);
-    if (res.d_jumpMul) hipFree(res.d_jumpMul);
-    if (res.d_jumpAdd) hipFree(res.d_jumpAdd);
-    if (res.d_jumpSteps) hipFree(res.d_jumpSteps);
+    if (res.d_jumpTable) hipFree(res.d_jumpTable);
 }
 
 void initGPU(GPUResources& res, Config& config) {
     for (int i = 0; i < 2; i++) {
-        HIP_CHECK(hipMalloc(&res.d_numbers[i], config.batchSize * sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&res.d_results[i], config.batchSize * sizeof(uint32_t)));
         HIP_CHECK(hipMalloc(&res.d_outVerified[i], sizeof(uint64_t)));
         HIP_CHECK(hipMalloc(&res.d_outTotalSteps[i], sizeof(uint64_t)));
         HIP_CHECK(hipMalloc(&res.d_outMaxSteps[i], sizeof(uint32_t)));
@@ -216,17 +182,8 @@ void initGPU(GPUResources& res, Config& config) {
         HIP_CHECK(hipStreamCreate(&res.streams[i]));
     }
 
-    HIP_CHECK(hipMalloc(&res.d_smallSteps, res.SMALL_TABLE_SIZE * sizeof(uint32_t)));
-    HIP_CHECK(hipMemcpy(res.d_smallSteps, res.h_smallSteps, res.SMALL_TABLE_SIZE * sizeof(uint32_t), hipMemcpyHostToDevice));
-
-    HIP_CHECK(hipMalloc(&res.d_jumpMul, TABLE_SIZE * sizeof(uint64_t)));
-    HIP_CHECK(hipMemcpy(res.d_jumpMul, res.h_jumpMul, TABLE_SIZE * sizeof(uint64_t), hipMemcpyHostToDevice));
-
-    HIP_CHECK(hipMalloc(&res.d_jumpAdd, TABLE_SIZE * sizeof(uint64_t)));
-    HIP_CHECK(hipMemcpy(res.d_jumpAdd, res.h_jumpAdd, TABLE_SIZE * sizeof(uint64_t), hipMemcpyHostToDevice));
-
-    HIP_CHECK(hipMalloc(&res.d_jumpSteps, TABLE_SIZE * sizeof(uint32_t)));
-    HIP_CHECK(hipMemcpy(res.d_jumpSteps, res.h_jumpSteps, TABLE_SIZE * sizeof(uint32_t), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(&res.d_jumpTable, TABLE_SIZE * sizeof(uint64_t)));
+    HIP_CHECK(hipMemcpy(res.d_jumpTable, res.h_jumpTable, TABLE_SIZE * sizeof(uint64_t), hipMemcpyHostToDevice));
 }
 
 int main() {
@@ -239,29 +196,15 @@ int main() {
     printf("  Exact k=%u bit acceleration table\n", TABLE_BITS);
     printf("============================================================\n\n");
 
-    const int SMALL_TABLE_SIZE = 65537;
-    uint32_t* h_smallSteps = new uint32_t[SMALL_TABLE_SIZE];
-    printf("[Info] Building small number lookup table (0-65536)...\n");
-    fflush(stdout);
-    for (int i = 0; i < SMALL_TABLE_SIZE; i++) {
-        h_smallSteps[i] = calcSmallSteps(i);
-    }
-
     printf("[Info] Building exact k=%u acceleration table (%u entries)...\n", TABLE_BITS, TABLE_SIZE);
     fflush(stdout);
-    uint64_t* h_jumpMul = new uint64_t[TABLE_SIZE];
-    uint64_t* h_jumpAdd = new uint64_t[TABLE_SIZE];
-    uint32_t* h_jumpSteps = new uint32_t[TABLE_SIZE];
-    buildJumpTable(h_jumpMul, h_jumpAdd, h_jumpSteps);
+    uint64_t* h_jumpTable = new uint64_t[TABLE_SIZE];
+    buildJumpTable(h_jumpTable);
     printf("[Info] All tables ready!\n\n");
 
     Config config;
     GPUResources res;
-    res.SMALL_TABLE_SIZE = SMALL_TABLE_SIZE;
-    res.h_smallSteps = h_smallSteps;
-    res.h_jumpMul = h_jumpMul;
-    res.h_jumpAdd = h_jumpAdd;
-    res.h_jumpSteps = h_jumpSteps;
+    res.h_jumpTable = h_jumpTable;
 
     initGPU(res, config);
 
@@ -278,9 +221,12 @@ int main() {
     }
     printf("\n");
 
-    printf("[Info] Batch size: %lluM numbers/batch (x2 buffers)\n", (unsigned long long)(config.batchSize / (1024*1024)));
-    printf("[Info] Acceleration table: %u bits (~%.1f MB)\n", TABLE_BITS,
-           (double)(TABLE_SIZE * (8+8+4)) / (1024*1024));
+    printf("[Info] Batch size: %lluM odd numbers/batch (x2 buffers, covers %lluM total)\n",
+           (unsigned long long)(config.batchSize / (1024*1024)),
+           (unsigned long long)(config.batchSize * 2 / (1024*1024)));
+    printf("[Info] Mode: odd-only verification (evens covered by n/2)\n");
+    printf("[Info] Acceleration table: %u bits (~%.1f MB, 8B packed, 2x unroll)\n", TABLE_BITS,
+           (double)(TABLE_SIZE * sizeof(uint64_t)) / (1024*1024));
     printf("\n");
 
     Checkpoint cp = loadCheckpoint();
@@ -296,6 +242,9 @@ int main() {
     if (totalRealVerified == 0 && currentNumber > 1) totalRealVerified = currentNumber - 1;
     if (totalVerified > totalRealVerified) totalVerified = totalRealVerified;
 
+    // Odd-only verification: ensure start is odd (evens are covered by n/2)
+    if ((currentNumber & 1ull) == 0) currentNumber++;
+
     printf("[Info] Starting from: %llu\n", (unsigned long long)currentNumber);
     printf("============================================================\n\n");
 
@@ -308,21 +257,16 @@ int main() {
     int activeBuffer = 0;
     bool hasPending = false;
 
-    const int threads = 256;
+    const int threads = 512;
 
     printf("Running...\n\n");
 
     while (true) {
         batchCount++;
 
-        uint64_t batchStart = currentNumber;
         uint64_t blocks64 = (config.batchSize + threads - 1) / threads;
 
         int buf = activeBuffer;
-
-        hipLaunchKernelGGL(generateNumbersKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
-                           res.d_numbers[buf], batchStart, config.batchSize);
-        HIP_CHECK(hipGetLastError());
 
         HIP_CHECK(hipMemsetAsync(res.d_outVerified[buf], 0, sizeof(uint64_t), res.streams[buf]));
         HIP_CHECK(hipMemsetAsync(res.d_outTotalSteps[buf], 0, sizeof(uint64_t), res.streams[buf]));
@@ -331,13 +275,8 @@ int main() {
         HIP_CHECK(hipMemsetAsync(res.d_outFound[buf], 0, sizeof(uint32_t), res.streams[buf]));
 
         hipLaunchKernelGGL(collatzKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
-                           res.d_numbers[buf], res.d_results[buf],
                            config.maxSteps, config.batchSize, startValue,
-                           res.d_smallSteps, res.d_jumpMul, res.d_jumpAdd, res.d_jumpSteps);
-        HIP_CHECK(hipGetLastError());
-
-        hipLaunchKernelGGL(reduceResultsKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
-                           res.d_results[buf], res.d_numbers[buf], config.batchSize,
+                           res.d_jumpTable,
                            res.d_outVerified[buf], res.d_outTotalSteps[buf],
                            res.d_outMaxSteps[buf], res.d_outMaxNumber[buf],
                            res.d_outFound[buf]);
@@ -369,12 +308,12 @@ int main() {
 
             totalVerified += h_outVerified;
             totalSteps += h_outTotalSteps;
-            totalRealVerified += config.batchSize;
+            totalRealVerified += config.batchSize * 2ull;
             if (h_outMaxSteps > maxSteps) {
                 maxSteps = h_outMaxSteps;
                 maxStepsNumber = h_outMaxNumber;
             }
-            currentNumber += config.batchSize;
+            currentNumber += config.batchSize * 2ull;
             startValue = currentNumber;
             hasPending = false;
         }
@@ -412,7 +351,7 @@ int main() {
             saveCheckpoint(newCp);
         }
 
-        if (currentNumber > UINT64_MAX - config.batchSize) {
+        if (currentNumber > UINT64_MAX - config.batchSize * 2ull) {
             printf("\n[Warning] Reached 64-bit limit\n");
             break;
         }
@@ -435,10 +374,7 @@ int main() {
     }
 
     cleanupGPU(res);
-    delete[] h_smallSteps;
-    delete[] h_jumpMul;
-    delete[] h_jumpAdd;
-    delete[] h_jumpSteps;
+    delete[] h_jumpTable;
 
     return 0;
 }
