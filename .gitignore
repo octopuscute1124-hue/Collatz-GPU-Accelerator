@@ -1,0 +1,20 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Checkpoint and runtime data
+checkpoint.bin
+speed_out.txt
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Build directory
+build/

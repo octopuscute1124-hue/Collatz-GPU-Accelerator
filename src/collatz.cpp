@@ -8,7 +8,7 @@
  *   - 8-byte packed jump table (add|mul|steps in one uint64)
  *   - k=18 table (2 MB) fully resident in L2 cache
  *   - Double-buffered async streams with GPU-side reduction
- *   - Checkpoint/resume support
+ *   - Checkpoint/resume support with versioned binary format
  *   - Counterexample detection with CPU re-verification
  */
 
@@ -31,6 +31,11 @@
         } \
     } while(0)
 
+// Checkpoint binary format identifiers.  Adding these prevents silent
+// corruption when the struct layout changes in future versions.
+#define CHECKPOINT_MAGIC   0x43545A4Cu  // "CTZL"
+#define CHECKPOINT_VERSION 1u
+
 struct Config {
     uint64_t batchSize = 1024ull * 1024 * 1024;   // 1G odd numbers/batch
     uint32_t maxSteps = 100000;
@@ -38,6 +43,8 @@ struct Config {
 };
 
 struct Checkpoint {
+    uint32_t magic;
+    uint32_t version;
     uint64_t lastNumber;
     uint64_t totalVerified;
     uint64_t totalSteps;
@@ -49,20 +56,39 @@ struct Checkpoint {
     uint64_t totalRealVerified;
 };
 
+// Return a checkpoint with safe default values.
+static Checkpoint defaultCheckpoint() {
+    Checkpoint cp;
+    std::memset(&cp, 0, sizeof(cp));
+    cp.magic = CHECKPOINT_MAGIC;
+    cp.version = CHECKPOINT_VERSION;
+    cp.lastNumber = 1;
+    cp.maxStepsNumber = 1;
+    return cp;
+}
+
 Checkpoint loadCheckpoint() {
-    Checkpoint cp = {1, 0, 0, 0, 1, 0, 0, 0, 0};
+    Checkpoint cp = defaultCheckpoint();
     std::ifstream file("checkpoint.bin", std::ios::binary);
     if (file.is_open()) {
         file.read((char*)&cp, sizeof(Checkpoint));
+        // Reject truncated files or outdated/unknown formats.
+        if (!file || cp.magic != CHECKPOINT_MAGIC || cp.version != CHECKPOINT_VERSION) {
+            cp = defaultCheckpoint();
+        }
         file.close();
     }
     return cp;
 }
 
 void saveCheckpoint(const Checkpoint& cp) {
+    // Ensure magic and version are always correct on disk.
+    Checkpoint tmp = cp;
+    tmp.magic = CHECKPOINT_MAGIC;
+    tmp.version = CHECKPOINT_VERSION;
     std::ofstream file("checkpoint.bin", std::ios::binary);
     if (file.is_open()) {
-        file.write((char*)&cp, sizeof(Checkpoint));
+        file.write((char*)&tmp, sizeof(Checkpoint));
         file.close();
     }
 }
@@ -144,7 +170,7 @@ extern "C" {
         const uint64_t* jumpTable,
         uint64_t* outVerified, uint64_t* outTotalSteps,
         uint32_t* outMaxSteps, uint64_t* outMaxNumber,
-        uint32_t* outFoundCounter
+        uint32_t* foundCounter
     );
 }
 
@@ -153,7 +179,7 @@ struct GPUResources {
     uint64_t* d_outTotalSteps[2];
     uint32_t* d_outMaxSteps[2];
     uint64_t* d_outMaxNumber[2];
-    uint32_t* d_outFound[2];
+    uint32_t* d_foundCounter[2];
     hipStream_t streams[2];
 
     uint64_t* d_jumpTable;
@@ -166,7 +192,7 @@ void cleanupGPU(GPUResources& res) {
         if (res.d_outTotalSteps[i]) hipFree(res.d_outTotalSteps[i]);
         if (res.d_outMaxSteps[i]) hipFree(res.d_outMaxSteps[i]);
         if (res.d_outMaxNumber[i]) hipFree(res.d_outMaxNumber[i]);
-        if (res.d_outFound[i]) hipFree(res.d_outFound[i]);
+        if (res.d_foundCounter[i]) hipFree(res.d_foundCounter[i]);
         if (res.streams[i]) hipStreamDestroy(res.streams[i]);
     }
     if (res.d_jumpTable) hipFree(res.d_jumpTable);
@@ -178,7 +204,7 @@ void initGPU(GPUResources& res, Config& config) {
         HIP_CHECK(hipMalloc(&res.d_outTotalSteps[i], sizeof(uint64_t)));
         HIP_CHECK(hipMalloc(&res.d_outMaxSteps[i], sizeof(uint32_t)));
         HIP_CHECK(hipMalloc(&res.d_outMaxNumber[i], sizeof(uint64_t)));
-        HIP_CHECK(hipMalloc(&res.d_outFound[i], sizeof(uint32_t)));
+        HIP_CHECK(hipMalloc(&res.d_foundCounter[i], sizeof(uint32_t)));
         HIP_CHECK(hipStreamCreate(&res.streams[i]));
     }
 
@@ -257,7 +283,8 @@ int main() {
     int activeBuffer = 0;
     bool hasPending = false;
 
-    const int threads = 512;
+    // 1024 threads per block reduces block-scheduling overhead vs 512.
+    const int threads = 1024;
 
     printf("Running...\n\n");
 
@@ -272,14 +299,14 @@ int main() {
         HIP_CHECK(hipMemsetAsync(res.d_outTotalSteps[buf], 0, sizeof(uint64_t), res.streams[buf]));
         HIP_CHECK(hipMemsetAsync(res.d_outMaxSteps[buf], 0, sizeof(uint32_t), res.streams[buf]));
         HIP_CHECK(hipMemsetAsync(res.d_outMaxNumber[buf], 0, sizeof(uint64_t), res.streams[buf]));
-        HIP_CHECK(hipMemsetAsync(res.d_outFound[buf], 0, sizeof(uint32_t), res.streams[buf]));
+        HIP_CHECK(hipMemsetAsync(res.d_foundCounter[buf], 0, sizeof(uint32_t), res.streams[buf]));
 
         hipLaunchKernelGGL(collatzKernel, dim3((unsigned int)blocks64), dim3(threads), 0, res.streams[buf],
                            config.maxSteps, config.batchSize, startValue,
                            res.d_jumpTable,
                            res.d_outVerified[buf], res.d_outTotalSteps[buf],
                            res.d_outMaxSteps[buf], res.d_outMaxNumber[buf],
-                           res.d_outFound[buf]);
+                           res.d_foundCounter[buf]);
         HIP_CHECK(hipGetLastError());
 
         if (hasPending) {
@@ -288,15 +315,15 @@ int main() {
 
             uint64_t h_outVerified, h_outTotalSteps, h_outMaxNumber;
             uint32_t h_outMaxSteps;
-            uint32_t h_outFound;
+            uint32_t h_foundCounter;
 
             HIP_CHECK(hipMemcpy(&h_outVerified, res.d_outVerified[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
             HIP_CHECK(hipMemcpy(&h_outTotalSteps, res.d_outTotalSteps[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
             HIP_CHECK(hipMemcpy(&h_outMaxSteps, res.d_outMaxSteps[prevBuf], sizeof(uint32_t), hipMemcpyDeviceToHost));
             HIP_CHECK(hipMemcpy(&h_outMaxNumber, res.d_outMaxNumber[prevBuf], sizeof(uint64_t), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(&h_outFound, res.d_outFound[prevBuf], sizeof(uint32_t), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(&h_foundCounter, res.d_foundCounter[prevBuf], sizeof(uint32_t), hipMemcpyDeviceToHost));
 
-            if (h_outFound != 0) {
+            if (h_foundCounter != 0) {
                 uint32_t realSteps = verifyNumberCPU(h_outMaxNumber, config.maxSteps);
                 if (realSteps >= config.maxSteps) {
                     foundCounterExample = true;
@@ -346,7 +373,8 @@ int main() {
         }
 
         if (batchCount % config.saveInterval == 0) {
-            Checkpoint newCp = {currentNumber, totalVerified, totalSteps,
+            Checkpoint newCp = {CHECKPOINT_MAGIC, CHECKPOINT_VERSION,
+                               currentNumber, totalVerified, totalSteps,
                                maxSteps, maxStepsNumber, batchCount, 0, startValue, totalRealVerified};
             saveCheckpoint(newCp);
         }

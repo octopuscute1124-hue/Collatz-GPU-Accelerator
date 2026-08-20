@@ -28,7 +28,7 @@ will eventually reach 1. This project leverages GPU parallelism to verify billio
 | v3 | AoS merged table (24B entry) + 512M batch | ~18.5 B |
 | v4 | Compressed entry (16B, mul in uint32) | ~32.0 B |
 | v5 | Bit-packed entry (8B: add\|mul\|steps) + k=18 | ~34.5 B |
-| **Final** | Software pipeline + manual 32x64 mul + 2x unroll | **~35 B** |
+| **Final** | Software pipeline + 128-bit multiply + 2x unroll + 1024 threads/block | **~35 B** |
 
 **Total speedup: ~6x from baseline.**
 
@@ -46,6 +46,8 @@ T^k(n) = (mul(r) * n + add(r)) >> k,   r = n mod 2^k
 
 where `mul(r) = 3^(# odd steps)` and `add(r)` is an additive constant, both depending only on `r`. This is exact for every n — not an approximation.
 
+The multiply `mul(r) * n + add` is computed with `unsigned __int128` to avoid overflow for large n (>= 2^32), then right-shifted by k bits.
+
 ### Odd-Only Verification
 
 Even numbers `n = 2m` reduce to `m` in one step. Since `m < n` always falls in the already-verified range, only odd numbers need direct computation. This halves the work.
@@ -58,13 +60,19 @@ Each table entry packs `add(29 bits) | mul(29 bits) | steps(6 bits)` into a sing
 
 Statistics (verified count, total steps, max steps, counterexample detection) are aggregated on the GPU via warp-level shuffle reduction with one atomic per warp. No intermediate per-number results array is needed.
 
+The max-steps record uses a CAS loop on the associated number to prevent a lower-steps warp from overwriting it after a higher-steps warp has set the record.
+
+### Accurate Step Statistics
+
+Verification status and step count are tracked as separate variables. When a number drops below the already-verified range, it is marked verified with the actual number of acceleration steps taken — not a placeholder value. This keeps total/average step statistics meaningful.
+
 ### Double Buffering & Async Streams
 
 Two GPU buffers with HIP streams overlap computation with result transfer, maximizing utilization.
 
 ### Checkpoint & Resume
 
-Progress is automatically saved to `checkpoint.bin` every 10 batches. Stop and resume anytime.
+Progress is automatically saved to `checkpoint.bin` every 10 batches. The binary format includes a magic number (`0x43545A4C`, "CTZL") and a version field, so future struct changes will not silently corrupt old checkpoints — an invalid or outdated file is detected and the verifier starts fresh. Stop and resume anytime.
 
 ### Counterexample Detection
 
@@ -105,6 +113,19 @@ Collatz-GPU-Accelerator/
 1. Run `build.bat` to compile.
 2. Run `run.bat` to start the verifier.
 3. To start fresh, delete `checkpoint.bin`.
+
+---
+
+## Changelog
+
+### v2.1 — Correctness & Maintenance Fixes
+
+- **[Severe] Fixed 64-bit multiplication overflow.** The kernel previously split `mul * n + add` into manual 32-bit halves and mishandled the carry between them, producing wrong results for n >= 2^32. Replaced with `unsigned __int128` (matching the host-side `verifyNumberCPU`).
+- **[Medium] Fixed step-count statistics.** When n dropped below `startValue`, `result` was set to `1` as a placeholder and then counted as one step. Verification status and actual step count are now separate variables; `totalSteps` reflects real acceleration steps.
+- **[Medium] Fixed max-steps number race condition.** `outMaxNumber` was updated with a bare `atomicExch` after `atomicMax` on `outMaxSteps`, allowing a lower-steps warp to overwrite the number after a higher-steps warp set it. Replaced with a CAS loop that re-checks the current max steps before committing.
+- **[Minor] Versioned checkpoint format.** Added `magic` and `version` fields to the `Checkpoint` struct. Old or corrupted checkpoint files are detected and the verifier starts from scratch instead of silently using garbage data.
+- **[Minor] Unified naming.** The counterexample flag buffer is now consistently named `foundCounter` across host and kernel code.
+- **Tuning.** Increased threads per block from 512 to 1024 to reduce block-scheduling overhead.
 
 ---
 

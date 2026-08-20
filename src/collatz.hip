@@ -9,7 +9,7 @@
  *   - Odd-only verification (evens reduce via n/2)
  *   - 8-bit packed jump table entry: add(29b)|mul(29b)|steps(6b) = 64 bits
  *   - k=18 table (2 MB) fits entirely in L2 cache
- *   - Software-pipelined, 2x-unrolled loop with manual 32x64 multiply
+ *   - Software-pipelined, 2x-unrolled loop with 128-bit multiply
  *   - Inline warp-level shuffle reduction (one atomic per warp)
  *   - No intermediate results array; stats updated directly via atomics
  */
@@ -34,16 +34,26 @@ extern "C" __global__ void collatzKernel(
     uint64_t* __restrict__ outTotalSteps,
     uint32_t* __restrict__ outMaxSteps,
     uint64_t* __restrict__ outMaxNumber,
-    uint32_t* __restrict__ outFoundCounter
+    uint32_t* __restrict__ foundCounter
 ) {
     uint64_t idx = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if (idx >= numElements) return;
 
     uint64_t n = startValue + idx * 2ull;
-    uint32_t result;
+    uint64_t orig = n;
+
+    // Separate semantics: whether the number is verified, and the actual
+    // number of acceleration steps taken.  Previously a single "result"
+    // variable carried both, causing stats distortion when n dropped below
+    // startValue (result was set to 1 as a placeholder, not real steps).
+    bool isVerified = false;
+    bool isCounterexample = false;
+    uint32_t actualSteps = 0;
 
     if (n <= startValue) {
-        result = 1u;
+        // First element (idx == 0) is already in the verified range.
+        isVerified = true;
+        actualSteps = 0;
     } else {
         uint32_t steps = 0;
         // Software pipeline: prefetch first entry.
@@ -55,11 +65,11 @@ extern "C" __global__ void collatzKernel(
             uint32_t add  = (uint32_t)(packed & ADD_MASK);
             uint32_t mul  = (uint32_t)((packed >> MUL_SHIFT) & ADD_MASK);
             uint32_t jmp  = (uint32_t)(packed >> STEP_SHIFT);
-            uint64_t n_lo = n & 0xFFFFFFFFull;
-            uint64_t n_hi = n >> 32;
-            uint64_t p_lo = (uint64_t)mul * n_lo + add;
-            uint64_t p_hi = (uint64_t)mul * n_hi;
-            n = (p_lo >> TABLE_BITS) | (p_hi << (64 - TABLE_BITS));
+            // Use 128-bit multiply to avoid the carry-overflow bug in the
+            // old manual 32x64 split.  The full product mul*n+add can exceed
+            // 64 bits, and shifting the truncated product gave wrong results
+            // for n >= 2^32.
+            n = (uint64_t)(((unsigned __int128)mul * n + add) >> TABLE_BITS);
             steps += jmp;
             if (n <= startValue || steps >= maxStepsLimit) break;
 
@@ -71,11 +81,7 @@ extern "C" __global__ void collatzKernel(
             add  = (uint32_t)(packed & ADD_MASK);
             mul  = (uint32_t)((packed >> MUL_SHIFT) & ADD_MASK);
             jmp  = (uint32_t)(packed >> STEP_SHIFT);
-            n_lo = n & 0xFFFFFFFFull;
-            n_hi = n >> 32;
-            p_lo = (uint64_t)mul * n_lo + add;
-            p_hi = (uint64_t)mul * n_hi;
-            n = (p_lo >> TABLE_BITS) | (p_hi << (64 - TABLE_BITS));
+            n = (uint64_t)(((unsigned __int128)mul * n + add) >> TABLE_BITS);
             steps += jmp;
 
             // Prefetch entry for next iteration
@@ -88,16 +94,19 @@ extern "C" __global__ void collatzKernel(
         }
 
         if (n <= startValue) {
-            result = 1u;
+            isVerified = true;
+            actualSteps = steps;
         } else if (steps >= maxStepsLimit) {
-            result = 0xFFFFFFFFu;
+            isCounterexample = true;
+            actualSteps = steps;
         } else {
-            result = steps;
+            // Defensive: should not happen; treat as verified.
+            isVerified = true;
+            actualSteps = steps;
         }
     }
 
     // ---- Inline warp-level reduction ----
-    uint64_t orig = startValue + idx * 2ull;
     uint64_t localVerified = 0;
     uint64_t localSteps = 0;
     uint32_t localMaxSteps = 0;
@@ -105,13 +114,13 @@ extern "C" __global__ void collatzKernel(
     uint32_t localFound = 0;
     uint64_t localFoundNumber = 0;
 
-    if (result == 0xFFFFFFFFu) {
+    if (isCounterexample) {
         localFound = 1u;
         localFoundNumber = orig;
-    } else if (result > 0u) {
+    } else if (isVerified) {
         localVerified = 1u;
-        localSteps = result;
-        localMaxSteps = result;
+        localSteps = actualSteps;
+        localMaxSteps = actualSteps;
         localMaxNumber = orig;
     }
 
@@ -137,15 +146,30 @@ extern "C" __global__ void collatzKernel(
     int lane = threadIdx.x & (warpSize - 1);
     if (lane == 0) {
         if (localFound) {
-            atomicExch(outFoundCounter, 1u);
+            atomicExch(foundCounter, 1u);
+            // Store the suspected counterexample in outMaxNumber.  The host
+            // reads this buffer for CPU re-verification when foundCounter != 0.
             atomicExch((unsigned long long*)outMaxNumber, (unsigned long long)localFoundNumber);
         }
         if (localVerified) atomicAdd((unsigned long long*)outVerified, (unsigned long long)localVerified);
         if (localSteps)    atomicAdd((unsigned long long*)outTotalSteps, (unsigned long long)localSteps);
 
+        // Atomically update the global max steps and its associated number.
+        // atomicMax on outMaxSteps is safe, but outMaxNumber must be updated
+        // with a CAS loop: a warp with fewer steps (whose atomicMax returned
+        // a smaller oldMax) could otherwise overwrite the number after a
+        // higher-steps warp has set it, leaving outMaxSteps and outMaxNumber
+        // inconsistent.
         uint32_t oldMax = atomicMax(outMaxSteps, localMaxSteps);
         if (localMaxSteps > oldMax) {
-            atomicExch((unsigned long long*)outMaxNumber, (unsigned long long)localMaxNumber);
+            uint64_t expected;
+            do {
+                expected = *outMaxNumber;
+                // Abort if another warp has since set a higher step count.
+                if (*(volatile uint32_t*)outMaxSteps > localMaxSteps) break;
+            } while (atomicCAS((unsigned long long*)outMaxNumber,
+                                (unsigned long long)expected,
+                                (unsigned long long)localMaxNumber) != (unsigned long long)expected);
         }
     }
 }
